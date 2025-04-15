@@ -92,64 +92,63 @@ class LaravelMaskedDump
     protected function dumpTableData(TableDefinition $table)
     {
         $query = '';
+        $chunkedQueries = [];
 
         $queryBuilder = $this->definition->getConnection()->table($table->getDoctrineTable()->getName());
-
         $table->modifyQuery($queryBuilder);
 
         $tableName = $table->getDoctrineTable()->getName();
         $tableName = "$this->escapeString$tableName$this->escapeString";
 
         if ($table->getChunkSize() > 0) {
-
-            $data = $queryBuilder->get();
-
-            if ($data->isEmpty()) {
-                return "";
+            // Get all columns for ordering
+            $columns = $table->getDoctrineTable()->getColumns();
+            if ($primaryKey = $table->getDoctrineTable()->getPrimaryKey()) {
+                // If primary key exists, use it for ordering
+                $queryBuilder->orderBy($primaryKey->getColumns()[0]);
+            } else {
+                // Otherwise order by all columns to ensure consistent chunking
+                foreach ($columns as $column) {
+                    $queryBuilder->orderBy($column->getName());
+                }
             }
 
-            $tableName = $table->getDoctrineTable()->getName();
-            $columns = array_keys((array)$data->first());
+            // Get the first row to determine column names
+            $firstRow = $queryBuilder->first();
+            if (!$firstRow) {
+                return "";
+            }
+            
+            $columns = array_keys((array)$firstRow);
             $column_names = "($this->escapeString" . join("$this->escapeString, $this->escapeString", $columns) . "$this->escapeString)";
 
-            $valuesChunks = $data
-                ->chunk($table->getChunkSize())
-                ->map(function ($chunk) use ($table) {
-                    $values = $chunk->map(function ($row) use ($table) {
-                        $row = $this->transformResultForInsert((array)$row, $table);
-                        $query = '(' . join(', ', $row) . ')';
-                        return $query;
-                    })->join(', ');
+            $values = [];
+            $queryBuilder->lazy()->each(function($row) use ($table, &$values, $tableName, $column_names, &$chunkedQueries) {
+                $row = $this->transformResultForInsert((array)$row, $table);
+                $values[] = '(' . join(', ', $row) . ')';
+                
+                if (count($values) >= $table->getChunkSize()) {
+                    $chunkedQueries[] = "INSERT INTO $tableName $column_names VALUES " . implode(', ', $values) . ';';
+                    $values = [];
+                }
+            });
 
-                    return $values;
-                });
-
-            $insert_statement = $valuesChunks->map(function ($values) use ($table, $tableName, $column_names) {
-                return "INSERT INTO $tableName $column_names VALUES " . $values . ';';
-            })
-                ->join(PHP_EOL);
-
-            return $insert_statement . PHP_EOL;
+            // Add any remaining values
+            if (!empty($values)) {
+                $chunkedQueries[] = "INSERT INTO $tableName $column_names VALUES " . implode(', ', $values) . ';';
+            }
+            
+            return implode(PHP_EOL, $chunkedQueries) . PHP_EOL;
         } else {
-            $queryBuilder->get()
-                ->each(function ($row, $index) use ($table, &$query, $tableName) {
-                    $row = $this->transformResultForInsert((array)$row, $table);
+            $queryBuilder->get()->each(function ($row, $index) use ($table, &$query, $tableName) {
+                $row = $this->transformResultForInsert((array)$row, $table);
 
-                    $query .= "INSERT INTO $tableName ($this->escapeString" . implode("$this->escapeString, $this->escapeString", array_keys($row)) . "$this->escapeString) VALUES ";
+                $query .= "INSERT INTO $tableName ($this->escapeString" . implode("$this->escapeString, $this->escapeString", array_keys($row)) . "$this->escapeString) VALUES ";
 
-                    $query .= "(";
-
-                    $firstColumn = true;
-                    foreach ($row as $value) {
-                        if (!$firstColumn) {
-                            $query .= ", ";
-                        }
-                        $query .= $value;
-                        $firstColumn = false;
-                    }
-
-                    $query .= ");" . PHP_EOL;
-                });
+                $query .= "(";
+                $query .= implode(', ', $row);
+                $query .= ");" . PHP_EOL;
+            });
         }
 
         return $query;
